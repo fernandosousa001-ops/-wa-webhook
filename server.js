@@ -1,51 +1,68 @@
-// Webhook WhatsApp Business → Firebase
 const express = require('express');
 const admin = require('firebase-admin');
 const app = express();
 app.use(express.json());
-// Firebase — usa a variável de ambiente FIREBASE_KEY
-const serviceAccount = JSON.parse(process.env.FIREBASE_KEY);
-admin.initializeApp({
-  credential: admin.credential.cert(serviceAccount),
-  databaseURL: process.env.FIREBASE_DB_URL
-});
-const db = admin.database();
-// GET — verificação do webhook pela Meta
+
+// Firebase
+const serviceAccount = JSON.parse(process.env.FIREBASE_KEY || '{}');
+if (serviceAccount.project_id) {
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+    databaseURL: process.env.FIREBASE_DB_URL
+  });
+}
+const db = admin.apps.length ? admin.database() : null;
+
+// GET — verificação da Meta
 app.get('/webhook', (req, res) => {
-  const token = req.query['hub.verify_token'];
-  if (token === process.env.VERIFY_TOKEN)
-    res.send(req.query['hub.challenge']);
-  else res.sendStatus(403);
+  const mode      = req.query['hub.mode'];
+  const token     = req.query['hub.verify_token'];
+  const challenge = req.query['hub.challenge'];
+  console.log('Verificação recebida:', { mode, token, challenge });
+  if (mode === 'subscribe' && token === process.env.VERIFY_TOKEN) {
+    console.log('Webhook verificado!');
+    res.status(200).send(challenge);
+  } else {
+    console.log('Token inválido. Esperado:', process.env.VERIFY_TOKEN, 'Recebido:', token);
+    res.sendStatus(403);
+  }
 });
-// POST — recebe mensagens do WhatsApp
+
+// POST — recebe mensagens
 app.post('/webhook', async (req, res) => {
   res.sendStatus(200);
   try {
     const entry = req.body?.entry?.[0]?.changes?.[0]?.value;
-    if (!entry?.messages) return;
+    if (!entry?.messages || !db) return;
     for (const msg of entry.messages) {
       const phone = msg.from;
-      const name = entry.contacts?.[0]?.profile?.name || phone;
-      const text = msg.type==='text' ? msg.text.body : `[${msg.type}]`;
-      const ts = parseInt(msg.timestamp) * 1000;
-      // Busca ou cria conversa
-      const snap = await db.ref('conversations')
+      const name  = entry.contacts?.[0]?.profile?.name || phone;
+      const text  = msg.type === 'text' ? msg.text.body : `[${msg.type}]`;
+      const ts    = parseInt(msg.timestamp) * 1000;
+      const snap  = await db.ref('conversations')
         .orderByChild('phone').equalTo(phone).limitToFirst(1).get();
       let convId;
       if (snap.exists()) {
         convId = Object.keys(snap.val())[0];
-        await db.ref(`conversations/${convId}`).update(
-          { lastMsg:text, lastDir:'in', updatedAt:ts, unread: admin.database.ServerValue.increment(1) });
+        await db.ref(`conversations/${convId}`).update({
+          lastMsg: text, lastDir: 'in', updatedAt: ts,
+          unread: admin.database.ServerValue.increment(1)
+        });
       } else {
         const ref = db.ref('conversations').push();
         convId = ref.key;
-        await ref.set({ name, phone, status:'open', unread:1,
-          agentUid:null, agentName:null, updatedAt:ts, lastMsg:text, lastDir:'in' });
+        await ref.set({ name, phone, status: 'open', unread: 1,
+          agentUid: null, agentName: null, updatedAt: ts,
+          lastMsg: text, lastDir: 'in' });
       }
       await db.ref(`messages/${convId}`).push(
-        { dir:'in', text, ts, type:msg.type });
+        { dir: 'in', text, ts, type: msg.type });
     }
-  } catch(e) { console.error(e); }
+  } catch(e) { console.error('Erro:', e.message); }
 });
-app.listen(process.env.PORT || 3000,
-  () => console.log('Webhook rodando!'));
+
+// Rota raiz para confirmar que está no ar
+app.get('/', (req, res) => res.send('Webhook rodando!'));
+
+app.listen(process.env.PORT || 3000, () => console.log('Servidor iniciado!'));
+```
