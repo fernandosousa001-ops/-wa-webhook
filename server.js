@@ -49,12 +49,16 @@ app.post('/webhook', async (req, res) => {
     const entry = req.body?.entry?.[0]?.changes?.[0]?.value;
     if (!entry?.messages || !db) return;
     for (const msg of entry.messages) {
-      const phone = msg.from;
+      const phone = msg.from.replace(/\D/g,'');
       const name  = entry.contacts?.[0]?.profile?.name || phone;
       const text  = msg.type === 'text' ? msg.text.body : `[${msg.type}]`;
       const ts    = parseInt(msg.timestamp) * 1000;
-      const snap  = await db.ref('conversations')
-        .orderByChild('phone').equalTo(phone).limitToFirst(1).get();
+      let snap = await db.ref('conversations')
+  .orderByChild('phone').equalTo(phone).limitToFirst(1).get();
+if(!snap.exists()){
+  snap = await db.ref('conversations')
+    .orderByChild('phone').equalTo('+'+phone).limitToFirst(1).get();
+}
       let convId;
       if (snap.exists()) {
         convId = Object.keys(snap.val())[0];
