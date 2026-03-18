@@ -28,8 +28,7 @@ const WA_PHONE_ID    = process.env.WHATSAPP_PHONE_ID || '';
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
 
 function normalizePhone(phone) {
-  const clean = phone.replace(/\D/g, '');
-  return clean;
+  return phone.replace(/\D/g, '');
 }
 
 async function findConversation(phone) {
@@ -71,6 +70,47 @@ async function sendWhatsApp(to, text) {
   } catch(e) { console.error('WA exception:', e.message); }
 }
 
+// ── Transcrição de áudio com OpenAI Whisper ──
+async function transcribeAudio(mediaId) {
+  if (!OPENAI_API_KEY) return null;
+  try {
+    const fetch = (await import('node-fetch')).default;
+    // 1. Busca URL do áudio na Meta
+    const mediaRes = await fetch(`https://graph.facebook.com/v19.0/${mediaId}`, {
+      headers: { 'Authorization': `Bearer ${WA_TOKEN}` }
+    });
+    if (!mediaRes.ok) return null;
+    const mediaData = await mediaRes.json();
+    const audioUrl = mediaData.url;
+
+    // 2. Baixa o áudio
+    const audioRes = await fetch(audioUrl, {
+      headers: { 'Authorization': `Bearer ${WA_TOKEN}` }
+    });
+    if (!audioRes.ok) return null;
+    const audioBuffer = await audioRes.buffer();
+
+    // 3. Transcreve com Whisper
+    const FormData = (await import('form-data')).default;
+    const form = new FormData();
+    form.append('file', audioBuffer, { filename: 'audio.ogg', contentType: 'audio/ogg' });
+    form.append('model', 'whisper-1');
+    form.append('language', 'pt');
+
+    const whisperRes = await fetch('https://api.openai.com/v1/audio/transcriptions', {
+      method: 'POST',
+      headers: { 'Authorization': `Bearer ${OPENAI_API_KEY}`, ...form.getHeaders() },
+      body: form
+    });
+    if (!whisperRes.ok) return null;
+    const whisperData = await whisperRes.json();
+    return whisperData.text || null;
+  } catch(e) {
+    console.error('Transcription error:', e.message);
+    return null;
+  }
+}
+
 async function getConvHistory(convId, limit = 10) {
   const snap = await db.ref(`messages/${convId}`).orderByChild('ts').limitToLast(limit).once('value');
   const msgs = [];
@@ -83,17 +123,12 @@ async function callAI(convId, userMessage) {
   try {
     const cfgSnap = await db.ref('aiConfig').once('value');
     const cfg = cfgSnap.exists() ? cfgSnap.val() : {};
-
     const systemPrompt = cfg.prompt ||
       `Você é um assistente de atendimento chamado ${cfg.name || 'Assistente'}.
 Empresa: ${cfg.company || 'Nossa empresa'}.
 ${cfg.description || 'Responda de forma educada e objetiva em português brasileiro.'}
-Regras:
-- Seja sempre cordial e profissional
-- Responda em português brasileiro
-- Mantenha respostas curtas (máximo 3 parágrafos)
-- Se não souber, diga que vai verificar e transferir para atendente
-- Se o cliente pedir humano/atendente, diga que vai transferir`;
+Regras: seja cordial, responda em português, mantenha respostas curtas.
+Se o cliente pedir humano/atendente, diga que vai transferir.`;
 
     const history = await getConvHistory(convId, 8);
     const messages = [{ role: 'system', content: systemPrompt }];
@@ -121,7 +156,47 @@ function wantsHuman(text) {
          t.includes('falar com') || t.includes('quero falar') || t.includes('me transfer');
 }
 
-app.get('/', (req, res) => res.send('Webhook rodando! Agente IA ativo.'));
+// ── Agendamento de mensagens ──
+async function processScheduled() {
+  if (!db) return;
+  try {
+    const now = Date.now();
+    const snap = await db.ref('scheduled')
+      .orderByChild('scheduledFor').endAt(now).once('value');
+    if (!snap.exists()) return;
+
+    const jobs = [];
+    snap.forEach(c => {
+      const job = c.val();
+      if (!job.done) jobs.push({ id: c.key, ...job });
+    });
+
+    for (const job of jobs) {
+      console.log(`Enviando mensagem agendada para ${job.phone}`);
+      await sendWhatsApp(job.phone.replace(/\D/g, ''), job.msg);
+      // Salva no histórico
+      if (job.convId) {
+        await db.ref(`messages/${job.convId}`).push({
+          dir: 'out', text: job.msg, ts: Date.now(), type: 'text',
+          byName: job.createdByName || 'Agendamento', scheduled: true
+        });
+        await db.ref(`conversations/${job.convId}`).update({
+          lastMsg: job.msg, lastDir: 'out', updatedAt: Date.now()
+        });
+      }
+      // Marca como enviado
+      await db.ref(`scheduled/${job.id}`).update({ done: true, sentAt: Date.now() });
+    }
+  } catch(e) {
+    console.error('Schedule error:', e.message);
+  }
+}
+
+// Verifica agendamentos a cada minuto
+setInterval(processScheduled, 60000);
+processScheduled(); // Roda na inicialização
+
+app.get('/', (req, res) => res.send('Webhook rodando! IA + Agendamento + Transcrição ativos.'));
 
 app.get('/webhook', (req, res) => {
   const mode = req.query['hub.mode'], token = req.query['hub.verify_token'], challenge = req.query['hub.challenge'];
@@ -139,60 +214,75 @@ app.post('/webhook', async (req, res) => {
       const phone = normalizePhone(msg.from);
       const name  = entry.contacts?.[0]?.profile?.name || phone;
       const ts    = parseInt(msg.timestamp) * 1000;
-      const text  = msg.type === 'text' ? msg.text?.body
-                  : msg.type === 'image' ? '[Imagem recebida]'
-                  : msg.type === 'audio' ? '[Áudio recebido]'
-                  : msg.type === 'video' ? '[Vídeo recebido]'
-                  : msg.type === 'document' ? '[Documento recebido]'
-                  : `[${msg.type}]`;
+
+      // Transcrição de áudio
+      let text = '';
+      let transcription = null;
+      if (msg.type === 'audio' && msg.audio?.id && OPENAI_API_KEY) {
+        console.log('Transcrevendo áudio...');
+        transcription = await transcribeAudio(msg.audio.id);
+        text = transcription ? `🎵 [Áudio transcrito]: ${transcription}` : '[Áudio recebido]';
+        console.log('Transcrição:', transcription);
+      } else {
+        text = msg.type === 'text'     ? msg.text?.body
+             : msg.type === 'image'    ? '[Imagem recebida]'
+             : msg.type === 'video'    ? '[Vídeo recebido]'
+             : msg.type === 'document' ? '[Documento recebido]'
+             : `[${msg.type}]`;
+      }
 
       const found = await findConversation(phone);
       let convId;
 
       if (found) {
         convId = found.convId;
-        await db.ref(`conversations/${convId}`).update({ lastMsg: text, lastDir: 'in', updatedAt: ts, unread: admin.database.ServerValue.increment(1) });
+        await db.ref(`conversations/${convId}`).update({
+          lastMsg: text, lastDir: 'in', updatedAt: ts,
+          unread: admin.database.ServerValue.increment(1)
+        });
         console.log(`Mensagem na conversa: ${convId}`);
       } else {
         const ref = db.ref('conversations').push();
         convId = ref.key;
         await ref.set({ name, phone, status: 'open', unread: 1, agentUid: null, agentName: null, aiActive: true, updatedAt: ts, lastMsg: text, lastDir: 'in' });
-        console.log(`Nova conversa: ${convId} para ${phone}`);
+        console.log(`Nova conversa: ${convId}`);
       }
 
-      await db.ref(`messages/${convId}`).push({ dir: 'in', text, ts, type: msg.type });
+      await db.ref(`messages/${convId}`).push({
+        dir: 'in', text, ts, type: msg.type,
+        ...(transcription ? { transcription } : {})
+      });
 
-      if (msg.type !== 'text') continue;
+      // IA só processa texto ou áudio transcrito
+      const aiText = msg.type === 'text' ? msg.text?.body : transcription;
+      if (!aiText) continue;
 
-      // Checa estado da conversa
       const convSnap = await db.ref(`conversations/${convId}`).once('value');
       const convData = convSnap.val() || {};
       const aiActive = convData.aiActive !== false;
 
-      // Cliente pediu humano
-      if (wantsHuman(text)) {
+      if (wantsHuman(aiText)) {
         await db.ref(`conversations/${convId}`).update({ aiActive: false });
         const transferMsg = 'Entendido! Estou te transferindo para um de nossos atendentes. Aguarde um momento. 👋';
         await sendWhatsApp(phone, transferMsg);
         await db.ref(`messages/${convId}`).push({ dir: 'out', text: transferMsg, ts: Date.now(), type: 'text', byAI: true, byName: '🤖 Agente IA' });
         await db.ref(`conversations/${convId}`).update({ lastMsg: transferMsg, lastDir: 'out', updatedAt: Date.now(), aiActive: false });
-        console.log(`IA desativada — cliente pediu humano: ${convId}`);
         continue;
       }
 
-      if (!aiActive) { console.log(`IA desativada para ${convId}`); continue; }
+      if (!aiActive) continue;
 
       const aiEnabledSnap = await db.ref('aiConfig/enabled').once('value');
-      if (aiEnabledSnap.val() === false) { console.log('IA desabilitada globalmente'); continue; }
+      if (aiEnabledSnap.val() === false) continue;
 
-      console.log(`Chamando IA para: ${text}`);
-      const aiReply = await callAI(convId, text);
+      console.log(`Chamando IA para: ${aiText}`);
+      const aiReply = await callAI(convId, aiText);
 
       if (aiReply) {
         await sendWhatsApp(phone, aiReply);
         await db.ref(`messages/${convId}`).push({ dir: 'out', text: aiReply, ts: Date.now(), type: 'text', byAI: true, byName: '🤖 Agente IA' });
         await db.ref(`conversations/${convId}`).update({ lastMsg: aiReply, lastDir: 'out', updatedAt: Date.now() });
-        console.log(`IA respondeu com sucesso`);
+        console.log('IA respondeu com sucesso');
       }
     }
   } catch(e) { console.error('Erro:', e.message); }
