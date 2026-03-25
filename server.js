@@ -299,12 +299,34 @@ app.post('/webhook', async (req, res) => {
       const phone = normalizePhone(msg.from);
       const name  = entry.contacts?.[0]?.profile?.name || phone;
       const ts    = parseInt(msg.timestamp) * 1000;
-      const text  = msg.type === 'text'     ? msg.text?.body
-                  : msg.type === 'audio'    ? '[Áudio recebido]'
-                  : msg.type === 'image'    ? '[Imagem recebida]'
-                  : msg.type === 'video'    ? '[Vídeo recebido]'
-                  : msg.type === 'document' ? '[Documento recebido]'
-                  : `[${msg.type}]`;
+      // Resolve media URL from Meta if needed
+      let text = msg.type === 'text' ? msg.text?.body : null;
+      let mediaUrl = null;
+      let fileName = null;
+
+      if (msg.type === 'image' || msg.type === 'document' || msg.type === 'video' || msg.type === 'audio') {
+        const mediaId = msg[msg.type]?.id;
+        if (mediaId) {
+          try {
+            const fetch2 = (await import('node-fetch')).default;
+            // Get media URL
+            const metaRes = await fetch2(`https://graph.facebook.com/v19.0/${mediaId}`, {
+              headers: { 'Authorization': `Bearer ${WA_TOKEN}` }
+            });
+            if (metaRes.ok) {
+              const metaData = await metaRes.json();
+              mediaUrl = metaData.url;
+              fileName = msg.document?.filename || msg[msg.type]?.caption || null;
+            }
+          } catch(e) { console.error('Media URL error:', e.message); }
+        }
+        if (msg.type === 'image') text = '[Imagem recebida]';
+        else if (msg.type === 'document') text = '[Documento: ' + (msg.document?.filename || 'arquivo') + ']';
+        else if (msg.type === 'video') text = '[Vídeo recebido]';
+        else if (msg.type === 'audio') text = '[Áudio recebido]';
+      }
+
+      if (!text) text = `[${msg.type}]`;
 
       // Busca ou cria conversa
       const found = await findConversation(phone);
@@ -321,8 +343,14 @@ app.post('/webhook', async (req, res) => {
         console.log('Nova conversa:', convId);
       }
 
-      // Salva mensagem
-      await saveMessage(convId, { dir: 'in', text, ts, type: msg.type });
+      // Salva mensagem com mídia se houver
+      const msgData = { dir: 'in', text, ts, type: msg.type };
+      if (mediaUrl) {
+        msgData.mediaUrl = mediaUrl;
+        msgData.mediaType = msg.type;
+        if (fileName) msgData.fileName = fileName;
+      }
+      await saveMessage(convId, msgData);
 
       if (msg.type !== 'text') continue;
 
