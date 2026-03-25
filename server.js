@@ -306,22 +306,36 @@ app.post('/webhook', async (req, res) => {
 
       if (msg.type === 'image' || msg.type === 'document' || msg.type === 'video' || msg.type === 'audio') {
         const mediaId = msg[msg.type]?.id;
-        if (mediaId) {
+        fileName = msg.document?.filename || null;
+
+        if (mediaId && (msg.type === 'image' || msg.type === 'document')) {
           try {
             const fetch2 = (await import('node-fetch')).default;
-            // Get media URL
+            // Step 1: Get media URL from Meta
             const metaRes = await fetch2(`https://graph.facebook.com/v19.0/${mediaId}`, {
               headers: { 'Authorization': `Bearer ${WA_TOKEN}` }
             });
             if (metaRes.ok) {
               const metaData = await metaRes.json();
-              mediaUrl = metaData.url;
-              fileName = msg.document?.filename || msg[msg.type]?.caption || null;
+              const tempUrl = metaData.url;
+              const mimeType = metaData.mime_type || (msg.type === 'image' ? 'image/jpeg' : 'application/octet-stream');
+
+              // Step 2: Download the actual file
+              const fileRes = await fetch2(tempUrl, {
+                headers: { 'Authorization': `Bearer ${WA_TOKEN}` }
+              });
+              if (fileRes.ok) {
+                const buffer = await fileRes.buffer();
+                const base64 = buffer.toString('base64');
+                mediaUrl = `data:${mimeType};base64,${base64}`;
+                console.log(`Media downloaded: ${msg.type} ${buffer.length} bytes`);
+              }
             }
-          } catch(e) { console.error('Media URL error:', e.message); }
+          } catch(e) { console.error('Media download error:', e.message); }
         }
+
         if (msg.type === 'image') text = '[Imagem recebida]';
-        else if (msg.type === 'document') text = '[Documento: ' + (msg.document?.filename || 'arquivo') + ']';
+        else if (msg.type === 'document') text = '[Documento: ' + (fileName || 'arquivo') + ']';
         else if (msg.type === 'video') text = '[Vídeo recebido]';
         else if (msg.type === 'audio') text = '[Áudio recebido]';
       }
