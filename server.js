@@ -296,6 +296,7 @@ app.post('/webhook', async (req, res) => {
     if (!entry?.messages || !db) return;
 
     for (const msg of entry.messages) {
+console.log('MSG RECEBIDA:', JSON.stringify(msg).slice(0, 200));
       const phone = normalizePhone(msg.from);
       const name  = entry.contacts?.[0]?.profile?.name || phone;
       const ts    = parseInt(msg.timestamp) * 1000;
