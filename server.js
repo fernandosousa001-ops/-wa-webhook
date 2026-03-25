@@ -17,7 +17,7 @@ try {
     console.log('Firebase conectado!');
   }
 } catch(e) {
-  console.log('Firebase não configurado:', e.message);
+  console.log('Firebase erro:', e.message);
 }
 
 const db = admin.apps.length ? admin.database() : null;
@@ -27,29 +27,27 @@ const WA_TOKEN       = process.env.WHATSAPP_ACCESS_TOKEN || '';
 const WA_PHONE_ID    = process.env.WHATSAPP_PHONE_ID || '';
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || '';
 
+// ── Utilitários ──
 function normalizePhone(phone) {
   return phone.replace(/\D/g, '');
 }
 
 async function findConversation(phone) {
-  const variants = new Set();
   const clean = normalizePhone(phone);
-  variants.add(clean);
-  variants.add('+' + clean);
+  const variants = new Set([clean, '+' + clean]);
   if (clean.startsWith('55') && clean.length === 12) {
-    const with9 = clean.slice(0, 4) + '9' + clean.slice(4);
-    variants.add(with9); variants.add('+' + with9);
+    const w9 = clean.slice(0, 4) + '9' + clean.slice(4);
+    variants.add(w9); variants.add('+' + w9);
   }
   if (clean.startsWith('55') && clean.length === 13) {
-    const without9 = clean.slice(0, 4) + clean.slice(5);
-    variants.add(without9); variants.add('+' + without9);
+    const wo9 = clean.slice(0, 4) + clean.slice(5);
+    variants.add(wo9); variants.add('+' + wo9);
   }
   for (const v of variants) {
-    const snap = await db.ref('conversations')
-      .orderByChild('phone').equalTo(v).limitToFirst(1).get();
+    const snap = await db.ref('conversations').orderByChild('phone').equalTo(v).limitToFirst(1).get();
     if (snap.exists()) {
       const convId = Object.keys(snap.val())[0];
-      return { snap, convId, conv: snap.val()[convId] };
+      return { convId, conv: snap.val()[convId] };
     }
   }
   return null;
@@ -66,52 +64,160 @@ async function sendWhatsApp(to, text) {
         to, type: 'text', text: { body: text }
       })
     });
-    if (!res.ok) { const err = await res.json(); console.error('WA error:', err?.error?.message); }
+    if (!res.ok) { const e = await res.json(); console.error('WA error:', e?.error?.message); }
+    else console.log('WA enviado para:', to);
   } catch(e) { console.error('WA exception:', e.message); }
 }
 
-// ── Transcrição de áudio com OpenAI Whisper ──
-async function transcribeAudio(mediaId) {
-  if (!OPENAI_API_KEY) return null;
-  try {
-    const fetch = (await import('node-fetch')).default;
-    // 1. Busca URL do áudio na Meta
-    const mediaRes = await fetch(`https://graph.facebook.com/v19.0/${mediaId}`, {
-      headers: { 'Authorization': `Bearer ${WA_TOKEN}` }
-    });
-    if (!mediaRes.ok) return null;
-    const mediaData = await mediaRes.json();
-    const audioUrl = mediaData.url;
-
-    // 2. Baixa o áudio
-    const audioRes = await fetch(audioUrl, {
-      headers: { 'Authorization': `Bearer ${WA_TOKEN}` }
-    });
-    if (!audioRes.ok) return null;
-    const audioBuffer = await audioRes.buffer();
-
-    // 3. Transcreve com Whisper
-    const FormData = (await import('form-data')).default;
-    const form = new FormData();
-    form.append('file', audioBuffer, { filename: 'audio.ogg', contentType: 'audio/ogg' });
-    form.append('model', 'whisper-1');
-    form.append('language', 'pt');
-
-    const whisperRes = await fetch('https://api.openai.com/v1/audio/transcriptions', {
-      method: 'POST',
-      headers: { 'Authorization': `Bearer ${OPENAI_API_KEY}`, ...form.getHeaders() },
-      body: form
-    });
-    if (!whisperRes.ok) return null;
-    const whisperData = await whisperRes.json();
-    return whisperData.text || null;
-  } catch(e) {
-    console.error('Transcription error:', e.message);
-    return null;
-  }
+async function saveMessage(convId, msg) {
+  await db.ref(`messages/${convId}`).push(msg);
 }
 
-async function getConvHistory(convId, limit = 10) {
+async function updateConv(convId, data) {
+  await db.ref(`conversations/${convId}`).update(data);
+}
+
+// ── CHATBOT COM MENU ──
+const MENU_PRINCIPAL = `Olá! Seja bem-vindo à *Fernando Sousa Fotografia* 📸
+
+Digite o número da opção desejada:
+
+1️⃣ Orçamentos e pacotes
+2️⃣ Agendar sessão
+3️⃣ Ver portfólio
+4️⃣ Falar com atendente
+
+_Responda com o número da opção._`;
+
+const MENU_ORCAMENTO = `💰 *Nossos pacotes:*
+
+📸 *Ensaio Individual* — a partir de R$ 350
+- 1h de sessão
+- 30 fotos editadas
+
+💑 *Ensaio de Casal* — a partir de R$ 450
+- 1h30 de sessão
+- 40 fotos editadas
+
+🎉 *Aniversário / 15 anos* — a partir de R$ 600
+- 2h de sessão
+- 50 fotos + álbum digital
+
+💍 *Casamento* — a partir de R$ 1.500
+- Cobertura completa
+- 100+ fotos editadas
+
+Para orçamento personalizado, responda *0* para falar com um atendente.`;
+
+const MENU_AGENDAMENTO = `📅 *Agendamento de sessão*
+
+Para marcar sua sessão, preciso de algumas informações:
+
+1. Qual tipo de sessão? (ensaio, aniversário, casamento...)
+2. Data preferida
+3. Horário de preferência (manhã, tarde ou noite)
+4. Local (Teresina ou outra cidade?)
+
+Responda com essas informações e confirmaremos em breve! 😊`;
+
+const MENU_PORTFOLIO = `📷 *Portfólio Fernando Sousa*
+
+Confira nosso trabalho:
+
+📱 *Instagram:* @fernando_sousa_fotografo
+🌐 *Site:* https://fernandosousa001-ops.github.io/portfolio-fernando-sousa.html
+
+Lá você encontra ensaios, casamentos, formaturas e muito mais! ✨
+
+Digite *0* para voltar ao menu ou falar com atendente.`;
+
+function wantsHuman(text) {
+  const t = (text || '').toLowerCase().trim();
+  return t === '4' || t === '0' ||
+    t.includes('atendente') || t.includes('humano') ||
+    t.includes('pessoa') || t.includes('falar com');
+}
+
+function isMenuCommand(text) {
+  const t = (text || '').toLowerCase().trim();
+  return ['menu', 'oi', 'olá', 'ola', 'bom dia', 'boa tarde', 'boa noite', 'início', 'inicio', 'começar', 'comecar', 'start', 'hi', 'hello'].includes(t);
+}
+
+async function handleChatbot(convId, conv, phone, text) {
+  const t = (text || '').trim();
+  const state = conv.chatbotState || 'idle';
+
+  // Verifica se chatbot está ativo
+  const cfgSnap = await db.ref('chatbotConfig/enabled').once('value');
+  const chatbotEnabled = cfgSnap.val() !== false;
+  if (!chatbotEnabled) return false;
+
+  // Se agente humano assumiu, não interfere
+  if (conv.aiActive === false) return false;
+
+  // Pede atendente humano
+  if (wantsHuman(t)) {
+    await sendWhatsApp(phone, 'Entendido! Estou te transferindo para um de nossos atendentes. Aguarde um momento. 👋');
+    await saveMessage(convId, { dir: 'out', text: 'Entendido! Estou te transferindo para um de nossos atendentes. Aguarde um momento. 👋', ts: Date.now(), type: 'text', byName: '🤖 Chatbot' });
+    await updateConv(convId, { aiActive: false, chatbotState: 'idle', lastMsg: 'Transferindo para atendente...', lastDir: 'out', updatedAt: Date.now() });
+    return true;
+  }
+
+  // Comando para voltar ao menu
+  if (isMenuCommand(t) || state === 'idle') {
+    await sendWhatsApp(phone, MENU_PRINCIPAL);
+    await saveMessage(convId, { dir: 'out', text: MENU_PRINCIPAL, ts: Date.now(), type: 'text', byName: '🤖 Chatbot' });
+    await updateConv(convId, { chatbotState: 'menu', lastMsg: '[Menu principal]', lastDir: 'out', updatedAt: Date.now() });
+    return true;
+  }
+
+  // Navegação no menu
+  if (state === 'menu') {
+    if (t === '1') {
+      await sendWhatsApp(phone, MENU_ORCAMENTO);
+      await saveMessage(convId, { dir: 'out', text: MENU_ORCAMENTO, ts: Date.now(), type: 'text', byName: '🤖 Chatbot' });
+      await updateConv(convId, { chatbotState: 'orcamento', lastMsg: '[Orçamentos]', lastDir: 'out', updatedAt: Date.now() });
+      return true;
+    }
+    if (t === '2') {
+      await sendWhatsApp(phone, MENU_AGENDAMENTO);
+      await saveMessage(convId, { dir: 'out', text: MENU_AGENDAMENTO, ts: Date.now(), type: 'text', byName: '🤖 Chatbot' });
+      await updateConv(convId, { chatbotState: 'agendamento', lastMsg: '[Agendamento]', lastDir: 'out', updatedAt: Date.now() });
+      return true;
+    }
+    if (t === '3') {
+      await sendWhatsApp(phone, MENU_PORTFOLIO);
+      await saveMessage(convId, { dir: 'out', text: MENU_PORTFOLIO, ts: Date.now(), type: 'text', byName: '🤖 Chatbot' });
+      await updateConv(convId, { chatbotState: 'portfolio', lastMsg: '[Portfólio]', lastDir: 'out', updatedAt: Date.now() });
+      return true;
+    }
+    // Opção inválida
+    const invalid = 'Opção inválida. Por favor, digite 1, 2, 3 ou 4.';
+    await sendWhatsApp(phone, invalid);
+    await saveMessage(convId, { dir: 'out', text: invalid, ts: Date.now(), type: 'text', byName: '🤖 Chatbot' });
+    return true;
+  }
+
+  // Estado de agendamento — coleta informações
+  if (state === 'agendamento') {
+    const confirm = `✅ Ótimo! Recebi suas informações:\n\n"${t}"\n\nVou verificar a disponibilidade e entrar em contato em breve para confirmar! 📅\n\nDigite *menu* para voltar ao início.`;
+    await sendWhatsApp(phone, confirm);
+    await saveMessage(convId, { dir: 'out', text: confirm, ts: Date.now(), type: 'text', byName: '🤖 Chatbot' });
+    await updateConv(convId, { chatbotState: 'aguardando', lastMsg: '[Agendamento recebido]', lastDir: 'out', updatedAt: Date.now(), unread: admin.database.ServerValue.increment(1) });
+    return true;
+  }
+
+  // Outros estados — volta ao menu se não entender
+  if (state === 'orcamento' || state === 'portfolio' || state === 'aguardando') {
+    // Passa para IA ou atendente
+    return false;
+  }
+
+  return false;
+}
+
+// ── IA ──
+async function getConvHistory(convId, limit = 8) {
   const snap = await db.ref(`messages/${convId}`).orderByChild('ts').limitToLast(limit).once('value');
   const msgs = [];
   snap.forEach(c => { const m = c.val(); if (m.type !== 'note') msgs.push(m); });
@@ -130,7 +236,7 @@ ${cfg.description || 'Responda de forma educada e objetiva em português brasile
 Regras: seja cordial, responda em português, mantenha respostas curtas.
 Se o cliente pedir humano/atendente, diga que vai transferir.`;
 
-    const history = await getConvHistory(convId, 8);
+    const history = await getConvHistory(convId);
     const messages = [{ role: 'system', content: systemPrompt }];
     history.forEach(m => {
       if (m.dir === 'in') messages.push({ role: 'user', content: m.text || '' });
@@ -144,64 +250,43 @@ Se o cliente pedir humano/atendente, diga que vai transferir.`;
       headers: { 'Authorization': `Bearer ${OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ model: cfg.model || 'gpt-4o-mini', messages, max_tokens: 500, temperature: 0.7 })
     });
-    if (!res.ok) { const err = await res.json(); console.error('OpenAI error:', err?.error?.message); return null; }
+    if (!res.ok) { const e = await res.json(); console.error('OpenAI error:', e?.error?.message); return null; }
     const data = await res.json();
     return data.choices?.[0]?.message?.content || null;
   } catch(e) { console.error('AI error:', e.message); return null; }
 }
 
-function wantsHuman(text) {
-  const t = (text || '').toLowerCase();
-  return t.includes('humano') || t.includes('atendente') || t.includes('pessoa real') ||
-         t.includes('falar com') || t.includes('quero falar') || t.includes('me transfer');
-}
-
-// ── Agendamento de mensagens ──
+// ── Agendamento ──
 async function processScheduled() {
   if (!db) return;
   try {
     const now = Date.now();
-    const snap = await db.ref('scheduled')
-      .orderByChild('scheduledFor').endAt(now).once('value');
+    const snap = await db.ref('scheduled').orderByChild('scheduledFor').endAt(now).once('value');
     if (!snap.exists()) return;
-
     const jobs = [];
-    snap.forEach(c => {
-      const job = c.val();
-      if (!job.done) jobs.push({ id: c.key, ...job });
-    });
-
+    snap.forEach(c => { const j = c.val(); if (!j.done) jobs.push({ id: c.key, ...j }); });
     for (const job of jobs) {
-      console.log(`Enviando mensagem agendada para ${job.phone}`);
+      console.log('Enviando agendado para:', job.phone);
       await sendWhatsApp(job.phone.replace(/\D/g, ''), job.msg);
-      // Salva no histórico
       if (job.convId) {
-        await db.ref(`messages/${job.convId}`).push({
-          dir: 'out', text: job.msg, ts: Date.now(), type: 'text',
-          byName: job.createdByName || 'Agendamento', scheduled: true
-        });
-        await db.ref(`conversations/${job.convId}`).update({
-          lastMsg: job.msg, lastDir: 'out', updatedAt: Date.now()
-        });
+        await saveMessage(job.convId, { dir: 'out', text: job.msg, ts: Date.now(), type: 'text', byName: job.createdByName || 'Agendamento', scheduled: true });
+        await updateConv(job.convId, { lastMsg: job.msg, lastDir: 'out', updatedAt: Date.now() });
       }
-      // Marca como enviado
       await db.ref(`scheduled/${job.id}`).update({ done: true, sentAt: Date.now() });
     }
-  } catch(e) {
-    console.error('Schedule error:', e.message);
-  }
+  } catch(e) { console.error('Schedule error:', e.message); }
 }
 
-// Verifica agendamentos a cada minuto
 setInterval(processScheduled, 60000);
-processScheduled(); // Roda na inicialização
 
-app.get('/', (req, res) => res.send('Webhook rodando! IA + Agendamento + Transcrição ativos.'));
+// ── Rotas ──
+app.get('/', (req, res) => res.send('WA Business Team — Webhook ativo!'));
 
 app.get('/webhook', (req, res) => {
-  const mode = req.query['hub.mode'], token = req.query['hub.verify_token'], challenge = req.query['hub.challenge'];
-  if (mode === 'subscribe' && token === VERIFY_TOKEN) { console.log('Webhook verificado!'); res.status(200).send(challenge); }
-  else res.sendStatus(403);
+  if (req.query['hub.mode'] === 'subscribe' && req.query['hub.verify_token'] === VERIFY_TOKEN) {
+    console.log('Webhook verificado!');
+    res.status(200).send(req.query['hub.challenge']);
+  } else res.sendStatus(403);
 });
 
 app.post('/webhook', async (req, res) => {
@@ -214,78 +299,57 @@ app.post('/webhook', async (req, res) => {
       const phone = normalizePhone(msg.from);
       const name  = entry.contacts?.[0]?.profile?.name || phone;
       const ts    = parseInt(msg.timestamp) * 1000;
+      const text  = msg.type === 'text'     ? msg.text?.body
+                  : msg.type === 'audio'    ? '[Áudio recebido]'
+                  : msg.type === 'image'    ? '[Imagem recebida]'
+                  : msg.type === 'video'    ? '[Vídeo recebido]'
+                  : msg.type === 'document' ? '[Documento recebido]'
+                  : `[${msg.type}]`;
 
-      // Transcrição de áudio
-      let text = '';
-      let transcription = null;
-      if (msg.type === 'audio' && msg.audio?.id && OPENAI_API_KEY) {
-        console.log('Transcrevendo áudio...');
-        transcription = await transcribeAudio(msg.audio.id);
-        text = transcription ? `🎵 [Áudio transcrito]: ${transcription}` : '[Áudio recebido]';
-        console.log('Transcrição:', transcription);
-      } else {
-        text = msg.type === 'text'     ? msg.text?.body
-             : msg.type === 'image'    ? '[Imagem recebida]'
-             : msg.type === 'video'    ? '[Vídeo recebido]'
-             : msg.type === 'document' ? '[Documento recebido]'
-             : `[${msg.type}]`;
-      }
-
+      // Busca ou cria conversa
       const found = await findConversation(phone);
-      let convId;
-
+      let convId, conv;
       if (found) {
-        convId = found.convId;
-        await db.ref(`conversations/${convId}`).update({
-          lastMsg: text, lastDir: 'in', updatedAt: ts,
-          unread: admin.database.ServerValue.increment(1)
-        });
-        console.log(`Mensagem na conversa: ${convId}`);
+        convId = found.convId; conv = found.conv;
+        await updateConv(convId, { lastMsg: text, lastDir: 'in', updatedAt: ts, unread: admin.database.ServerValue.increment(1) });
+        console.log('Mensagem na conversa:', convId);
       } else {
         const ref = db.ref('conversations').push();
         convId = ref.key;
-        await ref.set({ name, phone, status: 'open', unread: 1, agentUid: null, agentName: null, aiActive: true, updatedAt: ts, lastMsg: text, lastDir: 'in' });
-        console.log(`Nova conversa: ${convId}`);
+        conv = { name, phone, status: 'open', unread: 1, agentUid: null, agentName: null, aiActive: true, chatbotState: 'idle', updatedAt: ts, lastMsg: text, lastDir: 'in' };
+        await ref.set(conv);
+        console.log('Nova conversa:', convId);
       }
 
-      await db.ref(`messages/${convId}`).push({
-        dir: 'in', text, ts, type: msg.type,
-        ...(transcription ? { transcription } : {})
-      });
+      // Salva mensagem
+      await saveMessage(convId, { dir: 'in', text, ts, type: msg.type });
 
-      // IA só processa texto ou áudio transcrito
-      const aiText = msg.type === 'text' ? msg.text?.body : transcription;
-      if (!aiText) continue;
+      if (msg.type !== 'text') continue;
 
+      // Recarrega conv atualizada
       const convSnap = await db.ref(`conversations/${convId}`).once('value');
       const convData = convSnap.val() || {};
-      const aiActive = convData.aiActive !== false;
 
-      if (wantsHuman(aiText)) {
-        await db.ref(`conversations/${convId}`).update({ aiActive: false });
-        const transferMsg = 'Entendido! Estou te transferindo para um de nossos atendentes. Aguarde um momento. 👋';
-        await sendWhatsApp(phone, transferMsg);
-        await db.ref(`messages/${convId}`).push({ dir: 'out', text: transferMsg, ts: Date.now(), type: 'text', byAI: true, byName: '🤖 Agente IA' });
-        await db.ref(`conversations/${convId}`).update({ lastMsg: transferMsg, lastDir: 'out', updatedAt: Date.now(), aiActive: false });
-        continue;
-      }
+      // 1. Tenta chatbot primeiro
+      const chatbotHandled = await handleChatbot(convId, convData, phone, msg.text?.body || '');
+      if (chatbotHandled) continue;
 
-      if (!aiActive) continue;
+      // 2. Se chatbot não tratou e IA está ativa, chama IA
+      if (convData.aiActive === false) { console.log('Agente humano no controle:', convId); continue; }
 
       const aiEnabledSnap = await db.ref('aiConfig/enabled').once('value');
       if (aiEnabledSnap.val() === false) continue;
 
-      console.log(`Chamando IA para: ${aiText}`);
-      const aiReply = await callAI(convId, aiText);
-
+      console.log('Chamando IA para:', msg.text?.body);
+      const aiReply = await callAI(convId, msg.text?.body || '');
       if (aiReply) {
         await sendWhatsApp(phone, aiReply);
-        await db.ref(`messages/${convId}`).push({ dir: 'out', text: aiReply, ts: Date.now(), type: 'text', byAI: true, byName: '🤖 Agente IA' });
-        await db.ref(`conversations/${convId}`).update({ lastMsg: aiReply, lastDir: 'out', updatedAt: Date.now() });
+        await saveMessage(convId, { dir: 'out', text: aiReply, ts: Date.now(), type: 'text', byAI: true, byName: '🤖 Agente IA' });
+        await updateConv(convId, { lastMsg: aiReply, lastDir: 'out', updatedAt: Date.now() });
         console.log('IA respondeu com sucesso');
       }
     }
-  } catch(e) { console.error('Erro:', e.message); }
+  } catch(e) { console.error('Erro webhook:', e.message); }
 });
 
-app.listen(PORT, '0.0.0.0', () => console.log(`Servidor iniciado na porta ${PORT}`));
+app.listen(PORT, '0.0.0.0', () => console.log(`Servidor na porta ${PORT}`));
